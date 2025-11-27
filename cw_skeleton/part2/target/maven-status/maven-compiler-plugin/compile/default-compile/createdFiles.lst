@@ -1,0 +1,14 @@
+frontend/AuctionServiceGrpc$3.class
+frontend/AuctionServiceGrpc$MethodHandlers.class
+frontend/AuctionServiceGrpc.class
+frontend/AuctionServiceGrpc$AuctionServiceImplBase.class
+frontend/AuctionServiceGrpc$AuctionServiceMethodDescriptorSupplier.class
+frontend/AuctionServiceGrpc$1.class
+frontend/AuctionServiceGrpc$AuctionServiceBaseDescriptorSupplier.class
+frontend/AuctionServiceGrpc$AsyncService.class
+frontend/AuctionServiceGrpc$AuctionServiceStub.class
+frontend/AuctionServiceGrpc$AuctionServiceBlockingStub.class
+frontend/AuctionServiceGrpc$2.class
+replica/ReplicaImpl$1.class
+frontend/AuctionServiceGrpc$AuctionServiceFileDescriptorSupplier.class
+frontend/AuctionServiceGrpc$AuctionServiceFutureStub.class

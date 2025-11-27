@@ -9,111 +9,91 @@ import java.util.*;
 
 public class ReplicaImpl extends UnicastRemoteObject implements ReplicatedAuction {
 
-    // ----- sequencing & log state (I suggest you keep these and use them) -----
+    // ----- sequencing & log state -----
     private boolean isLeader = false;
-    private long lastSeqAssigned = 0; // This is used by the leader to assign a seq number to each Operation      
-    private long lastCommitted = 0;           
-    private long lastApplied = 0;             
-    private final TreeMap<Long, LogEntry> log = new TreeMap<>(); 
+    private long lastSeqAssigned = 0;   // leader uses this to assign seq numbers
+    private long lastCommitted = 0;
+    private long lastApplied = 0;
+    private final TreeMap<Long, LogEntry> log = new TreeMap<>();
 
-    // ----- state machine (in-memory) -----
-    // Local auction state for this replica only
-    private static class LocalAuctionState {
-        final int ownerID;
-        final AuctionItem item;
-        boolean isClosed;
-        int highestBidder;
-
-        LocalAuctionState(int ownerID, AuctionItem item) {
-            this.ownerID = ownerID;
-            this.item = item;
-            this.isClosed = false;
-            this.highestBidder = -1;
-        }
-    }
-
+    // ----- state machine (auction logic) -----
     private final Map<Integer, String> users = new HashMap<>();
     private final Map<Integer, LocalAuctionState> items = new HashMap<>();
     private int nextUserId = 0;
     private int nextItemId = 0;
 
-    // ----- replica ID and name (keep these) ----
+    // ----- replica ID and name -----
     private final int id;
-    private final String myName;   
-    public ReplicaImpl(int id, String rmiName) throws RemoteException { 
-        this.id = id; 
-        this.myName = rmiName; 
+    private final String myName;
+
+    public ReplicaImpl(int id, String rmiName) throws RemoteException {
+        super();
+        this.id = id;
+        this.myName = rmiName;
     }
 
-    // ================= Auction (read-only calls are executed locally) =================
-    @Override 
-    public synchronized AuctionItem getSpec(int itemID) { 
+    // Local state structure for each auction
+    private static class LocalAuctionState {
+        final int ownerId;
+        final AuctionItem item;
+        boolean isClosed = false;
+        int highestBidder = -1;
+
+        LocalAuctionState(int ownerId, AuctionItem item) {
+            this.ownerId = ownerId;
+            this.item = item;
+        }
+    }
+
+    // ================= Auction (read-only) =================
+
+    @Override
+    public synchronized AuctionItem getSpec(int itemID) {
         LocalAuctionState st = items.get(itemID);
         return (st == null) ? null : st.item;
     }
 
-    @Override 
-    public synchronized AuctionItem[] listItems() { 
+    @Override
+    public synchronized AuctionItem[] listItems() {
         List<AuctionItem> active = new ArrayList<>();
         for (LocalAuctionState st : items.values()) {
             if (!st.isClosed) {
                 active.add(st.item);
             }
         }
-        return active.toArray(new AuctionItem[0]); 
+        return active.toArray(new AuctionItem[0]);
     }
 
-    // NOTE: this is now a local function that may be used to update local state 
-    private synchronized int newAuction(int userID, AuctionSaleItem item) {
-        // If userID not registered, return -1
+    // ================= Local state machine helpers =================
+
+    private synchronized int register(String email) {
+        int uid = nextUserId++;
+        users.put(uid, email);
+        return uid;
+    }
+
+    private synchronized int newAuction(int userID, AuctionSaleItem sale) {
         if (!users.containsKey(userID)) {
             return -1;
         }
-
-        int itemID = nextItemId++;
-        // Adjust field access if AuctionSaleItem uses getters instead of public fields
-        AuctionItem ai = new AuctionItem(itemID, item.name, item.description, item.reservePrice);
-        LocalAuctionState st = new LocalAuctionState(userID, ai);
-        items.put(itemID, st);
-        return itemID;
+        int itemId = nextItemId++;
+        AuctionItem item = new AuctionItem(itemId, sale.name, sale.description, sale.reservePrice);
+        LocalAuctionState st = new LocalAuctionState(userID, item);
+        items.put(itemId, st);
+        return itemId;
     }
 
-    // NOTE: this is now a local function that may be used to update local state 
-    private synchronized AuctionResult closeAuction(int userID, int itemID){
+    private synchronized boolean bid(int userID, int itemID, int price) {
         LocalAuctionState st = items.get(itemID);
-        if (st == null) {
-            return null; // item missing
-        }
-        if (st.ownerID != userID) {
-            return null; // only owner may close
-        }
-        if (st.isClosed) {
-            return null; // already closed
-        }
-
-        st.isClosed = true;
-        // If no bids, highestBidder will be -1 and highestBid 0
-        return new AuctionResult(itemID, st.highestBidder, st.item.highestBid);
-    }
-
-    // NOTE: this is now a local function that may be used to update local state 
-    private synchronized boolean bid(int userID, int itemID, int price){
-        LocalAuctionState st = items.get(itemID);
-        if (st == null) {
-            return false; // item missing
-        }
-        if (!users.containsKey(userID)) {
-            return false; // unknown user
-        }
-        if (st.isClosed) {
-            return false; // no bids on closed auctions
-        }
+        if (st == null) return false;
+        if (!users.containsKey(userID)) return false;
+        if (st.isClosed) return false;
 
         int current = st.item.highestBid;
         int reserve = st.item.reservePrice;
 
-        // Bid must be strictly higher than both highestBid and reserve
-        if (price > current && price > reserve) {
+        // Spec semantics: price > currentHighest AND price >= reservePrice
+        if (price > current && price >= reserve) {
             st.item.highestBid = price;
             st.highestBidder = userID;
             return true;
@@ -121,190 +101,58 @@ public class ReplicaImpl extends UnicastRemoteObject implements ReplicatedAuctio
         return false;
     }
 
-    // NOTE: this is now a local function that may be used to update local state 
-    private synchronized int register(String email) {
-        int uid = nextUserId++;
-        users.put(uid, email);
-        return uid;
-    }
-    
+    private synchronized AuctionResult closeAuction(int userID, int itemID) {
+        LocalAuctionState st = items.get(itemID);
+        if (st == null) return null;
+        if (st.ownerId != userID) return null;
 
-    // ================= Replication core =================
-    @Override
-    public synchronized OperationResult handleClientOperation(Operation op, List<String> memberList) throws RemoteException {
-        if (!isLeader) {
-            //This should not happen
-            return OperationResult.fail("Not leader");
+        // Idempotent close: if already closed we just return the same outcome
+        if (!st.isClosed) {
+            st.isClosed = true;
         }
-
-        // Step 1: Assign seqNo and add operation to local log (via propose on self)
-        long seqNo = ++lastSeqAssigned;
-        this.propose(seqNo, op); // logs locally
-
-        int totalMembers = memberList.size();
-        int needed = majority(totalMembers);
-        int acks = 1; // leader (self) implicitly acks
-
-        // Step 2: Propose to replicas in memberList (excluding self), ignore unreachable
-        for (String name : memberList) {
-            if (name.equals(myName)) {
-                continue; // skip self, already proposed
-            }
-            try {
-                ReplicatedAuction r = lookup(name);
-                boolean ok = r.propose(seqNo, op);
-                if (ok) {
-                    acks++;
-                }
-            } catch (Exception e) {
-                // ignore unreachable replicas
-            }
-        }
-
-        // Step 3: Check majority
-        if (acks < needed) {
-            return OperationResult.fail("No majority quorum for operation");
-        }
-
-        // Step 3.1: Leader executes op locally, marks log entry as committed, updates seq state
-        OperationResult result = apply(op);
-        LogEntry le = log.get(seqNo);
-        if (le != null) {
-            le.committed = true;
-        }
-        if (seqNo > lastCommitted) {
-            lastCommitted = seqNo;
-        }
-        if (seqNo > lastApplied) {
-            // we just applied this operation in apply(), so reflect that
-            lastApplied = seqNo;
-        }
-
-        // Step 3.2: Call commitUpTo on all replicas (including self), ignore unreachable
-        for (String name : memberList) {
-            try {
-                ReplicatedAuction r = lookup(name);
-                r.commitUpTo(seqNo);
-            } catch (Exception e) {
-                // ignore unreachable replicas during commit
-            }
-        }
-
-        // Step 4: Return result from leader's apply()
-        return result;
+        return new AuctionResult(itemID, st.highestBidder, st.item.highestBid);
     }
 
-    // Helper method to compute the required number of replicas to achieve majority given the number of the members
-    private int majority(int n){ 
-        return (n/2)+1; 
-    }
-
-    @Override
-    public synchronized boolean propose(long seqNo, Operation op) {
-        // Add the operation to the local Log
-        LogEntry existing = log.get(seqNo);
-        if (existing == null || !existing.committed) {
-            log.put(seqNo, new LogEntry(seqNo, op)); 
-        }
-        return true;
-    }
-
-    @Override
-    public synchronized boolean commitUpTo(long seqNo) {
-
-        if (seqNo <= lastCommitted) {
-            // nothing new to commit
-            return true;
-        }
-
-        // Step 1 & 2: Ensure we have all entries [lastCommitted+1 .. seqNo]; if not, pull from leader
-        boolean missing = false;
-        for (long s = lastCommitted + 1; s <= seqNo; s++) {
-            if (!log.containsKey(s)) {
-                missing = true;
-                break;
-            }
-        }
-
-        if (missing) {
-            try {
-                String leaderName = findLeaderName();
-                if (leaderName != null) {
-                    ReplicatedAuction leader = lookup(leaderName);
-                    List<LogEntry> entries = leader.getEntriesAfter(lastCommitted);
-                    for (LogEntry le : entries) {
-                        LogEntry local = log.get(le.seqNo);
-                        if (local == null) {
-                            log.put(le.seqNo, new LogEntry(le.seqNo, le.op));
-                        }
-                        // Mark them as committed; we will apply below
-                        log.get(le.seqNo).committed = true;
-                    }
-                }
-            } catch (Exception e) {
-                // if we can't contact leader, we still try to commit what we have
-            }
-        }
-
-        // Step 3: Execute and commit new operation(s) in order
-        for (long s = lastApplied + 1; s <= seqNo; s++) {
-            LogEntry le = log.get(s);
-            if (le != null) {
-                // If the leader marked it committed or we just did above for fetched entries
-                if (!le.committed) {
-                    le.committed = true;
-                }
-                apply(le.op);
-                lastApplied = s;
-            } else {
-                // gap still present; stop
-                break;
-            }
-        }
-
-        if (seqNo > lastCommitted) {
-            lastCommitted = seqNo;
-        }
-
-        return true;
-    }
-
-    // You may use this function to apply operations on the local state
-    private OperationResult apply(Operation op){
+    // Apply a log operation to local state
+    private synchronized OperationResult apply(Operation op) {
         switch (op.type) {
             case REGISTER -> {
-                int uid = register(op.email);  
+                int uid = register(op.email);
                 return OperationResult.reg(uid);
             }
             case NEW_AUCTION -> {
-                int iid = newAuction(op.userId, new AuctionSaleItem(op.name, op.description, op.reservePrice));
-                return (iid > 0) ? OperationResult.newA(iid) : OperationResult.fail("unknown user");
+                int iid = newAuction(op.userId,
+                        new AuctionSaleItem(op.name, op.description, op.reservePrice));
+                // -1 means error; 0,1,2,... are valid item IDs
+                return (iid >= 0)
+                        ? OperationResult.newA(iid)
+                        : OperationResult.fail("unknown user");
             }
             case BID -> {
                 boolean ok = bid(op.userId, op.itemId, op.reservePrice);
                 return OperationResult.bid(ok);
             }
             case CLOSE -> {
-                AuctionResult ar = closeAuction(op.userId, op.itemId); // null if not owner
-                if (ar == null) 
+                AuctionResult ar = closeAuction(op.userId, op.itemId);
+                if (ar == null)
                     return OperationResult.fail("Auction close not permitted!");
                 return OperationResult.close(ar.itemID, ar.winningUser, ar.price);
             }
-            default -> { return OperationResult.fail("Unknown op"); }
+            default -> {
+                return OperationResult.fail("Unknown op");
+            }
         }
     }
 
-    // ================= Sync & helpers =================
+    // ================= Replication core =================
 
-    @Override 
-    public synchronized List<LogEntry> getEntriesAfter(long fromSeq) {
-        List<LogEntry> out = new ArrayList<>();
-        for (var e : log.tailMap(fromSeq+1).entrySet()) {
-            LogEntry le = e.getValue();
-            if (le.committed) 
-                out.add(new LogEntry(le.seqNo, le.op)); 
-        }
-        return out;
+    private int majority(int n) {
+        return (n / 2) + 1;
+    }
+
+    private ReplicatedAuction lookup(String rmiName) throws Exception {
+        Registry reg = LocateRegistry.getRegistry();
+        return (ReplicatedAuction) reg.lookup(rmiName);
     }
 
     private String findLeaderName() throws Exception {
@@ -313,27 +161,139 @@ public class ReplicaImpl extends UnicastRemoteObject implements ReplicatedAuctio
         return fe.getCurrentSequencerName();
     }
 
-    private ReplicatedAuction lookup(String rmiName) throws Exception {
-        Registry reg = LocateRegistry.getRegistry();
-        return (ReplicatedAuction) reg.lookup(rmiName);
+    @Override
+    public synchronized OperationResult handleClientOperation(Operation op, java.util.List<String> memberList)
+            throws RemoteException {
+
+        if (!isLeader) {
+            return OperationResult.fail("Not leader");
+        }
+
+        // Step 1: append to local log
+        long seqNo = ++lastSeqAssigned;
+        log.put(seqNo, new LogEntry(seqNo, op));
+
+        // Step 2: propose to other replicas
+        int total = memberList.size();
+        int need = majority(total);
+        int acks = 1; // self
+
+        for (String name : memberList) {
+            if (name.equals(myName)) continue; // don't RMI-call ourselves
+
+            try {
+                ReplicatedAuction r = lookup(name);
+                if (r.propose(seqNo, op)) {
+                    acks++;
+                }
+            } catch (Exception e) {
+                // ignore unreachable replicas during propose
+            }
+        }
+
+        // Step 3: check majority
+        if (acks < need) {
+            log.remove(seqNo);
+            return OperationResult.fail("No majority quorum for seq " + seqNo);
+        }
+
+        // Step 3.1: commit + apply locally
+        lastCommitted = Math.max(lastCommitted, seqNo);
+        OperationResult result = apply(op);   // mutate state
+        lastApplied = Math.max(lastApplied, seqNo);
+
+        LogEntry le = log.get(seqNo);
+        if (le != null) {
+            le.committed = true;
+        }
+
+        // Step 3.2: tell followers to commit up to seqNo (skip self to avoid deadlock)
+        for (String name : memberList) {
+            if (name.equals(myName)) continue;
+            try {
+                ReplicatedAuction r = lookup(name);
+                r.commitUpTo(seqNo);
+            } catch (Exception e) {
+                // ignore unreachable followers
+            }
+        }
+
+        return result;
     }
 
-    @Override 
-    public synchronized long getLastCommittedSeqNo() { 
-        return lastCommitted; 
+    @Override
+    public synchronized boolean propose(long seqNo, Operation op) {
+        LogEntry existing = log.get(seqNo);
+        if (existing == null || !existing.committed) {
+            log.put(seqNo, new LogEntry(seqNo, op));
+        }
+        return true;
     }
 
-    // You may not use this method but it is here if you need it
-    // Used to check if a replica is the leader
-    @Override 
-    public synchronized boolean isSequencer() { 
-        return isLeader; 
+    @Override
+    public synchronized boolean commitUpTo(long seqNo) {
+
+        // Commit and apply all entries up to seqNo, fetching missing ones from leader if needed
+        while (lastCommitted < seqNo) {
+            long next = lastCommitted + 1;
+            LogEntry e = log.get(next);
+
+            // Step 2: if missing entries, pull from leader
+            if (e == null) {
+                try {
+                    String leaderName = findLeaderName();
+                    if (leaderName == null) break;
+                    ReplicatedAuction leader = lookup(leaderName);
+                    java.util.List<LogEntry> missing = leader.getEntriesAfter(next - 1);
+                    for (LogEntry le : missing) {
+                        if (!log.containsKey(le.seqNo)) {
+                            log.put(le.seqNo, new LogEntry(le.seqNo, le.op));
+                        }
+                    }
+                    e = log.get(next);
+                    if (e == null) break; // still missing, give up
+                } catch (Exception ex) {
+                    break;
+                }
+            }
+
+            // Step 3: execute and commit
+            if (next > lastApplied) {
+                apply(e.op);
+                lastApplied = next;
+            }
+            e.committed = true;
+            lastCommitted = next;
+        }
+
+        return true;
     }
 
-    // Set the replica as a leader or not (isLeader is true: you are leader, isLeader is false: you are not)
-    @Override 
-    public synchronized void setSequencer(boolean isLeader){ 
-        this.isLeader = isLeader; 
+    @Override
+    public synchronized java.util.List<LogEntry> getEntriesAfter(long fromSeq) {
+        java.util.List<LogEntry> out = new ArrayList<>();
+        for (var entry : log.tailMap(fromSeq + 1).entrySet()) {
+            LogEntry le = entry.getValue();
+            if (le.committed) {
+                out.add(new LogEntry(le.seqNo, le.op));
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public synchronized long getLastCommittedSeqNo() {
+        return lastCommitted;
+    }
+
+    @Override
+    public boolean isSequencer() {
+        return isLeader;
+    }
+
+    @Override
+    public void setSequencer(boolean isLeader) {
+        this.isLeader = isLeader;
         if (isLeader) {
             this.lastSeqAssigned = this.lastCommitted;
         }

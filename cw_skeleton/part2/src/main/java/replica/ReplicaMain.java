@@ -1,8 +1,6 @@
 package replica;
 
-import common.*;
 import frontend.FrontEndAdmin;
-
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 
@@ -15,29 +13,41 @@ public class ReplicaMain {
         int id = Integer.parseInt(args[0]);
         String name = "replica" + id;
 
-        // 1) Create and bind the replica in the local RMI registry
+        // Register the replica with rmiregistry
         ReplicatedAuction r = new ReplicaImpl(id, name);
         Registry reg = LocateRegistry.getRegistry();
         reg.rebind(name, r);
         System.out.println("Replica " + id + " bound as " + name);
 
+        // ----- Optional startup sync (criterion 2.3) -----
         try {
-            // 2) Get FrontEndAdmin and register this replica
-            FrontEndAdmin fe = (FrontEndAdmin) reg.lookup("FrontEnd");
-            // We are NOT doing any sync-from-leader here (skipping steps 1–3 from the spec).
+            Registry rmiReg = LocateRegistry.getRegistry();
+            FrontEndAdmin fe = (FrontEndAdmin) rmiReg.lookup("FrontEnd");
+
+            String leaderName = fe.getCurrentSequencerName();
+
+            if (leaderName != null && !leaderName.equals(name)) {
+                System.out.println("Existing leader is " + leaderName + ", syncing state...");
+                ReplicatedAuction leader = (ReplicatedAuction) rmiReg.lookup(leaderName);
+                long lastCommitted = leader.getLastCommittedSeqNo();
+                if (lastCommitted > 0) {
+                    r.commitUpTo(lastCommitted);
+                }
+            } else if (leaderName == null) {
+                System.out.println("No existing leader reported by FrontEnd; this may be the first replica.");
+            }
+
+            // Now register this replica as a member
             fe.registerReplica(id, name);
             System.out.println("Replica " + id + " registered with FrontEnd");
+
         } catch (Exception e) {
             System.err.println("Error during replica initialisation: " + e);
-            e.printStackTrace();
         }
 
         System.out.println("Replica " + id + " ready.");
 
-        // 3) Keep JVM alive so this replica stays reachable via RMI
-        try {
-            new java.util.concurrent.CountDownLatch(1).await();
-        } catch (InterruptedException ignored) {
-        }
+        // Keep JVM alive
+        new java.util.concurrent.CountDownLatch(1).await();
     }
 }
